@@ -49,6 +49,48 @@ pub enum LoginState {
     NeedsLogin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostTwoFactorDiagnosticResult {
+    Success,
+    HttpStatus(u16),
+    AppleServiceCode(i64),
+    ResponseBodyFailure,
+    PlistParseFailure,
+    TransportFailure,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostTwoFactorLoginStage {
+    InitialLogin,
+    ProofLogin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostTwoFactorDiagnosticEvent {
+    TrustedDeviceVerifyBegin,
+    TrustedDeviceVerifySuccess,
+    TrustedDeviceVerifyRejected {
+        apple_service_code: i64,
+    },
+    TrustedDeviceVerifyFailure {
+        result: PostTwoFactorDiagnosticResult,
+    },
+    TransitionToNeedsLogin,
+    TransitionToNeedsDevice2FAVerification,
+    PostTwoFactorInitialLoginBegin,
+    PostTwoFactorInitialLoginResponseResult {
+        result: PostTwoFactorDiagnosticResult,
+    },
+    PostTwoFactorProofLoginBegin,
+    PostTwoFactorProofLoginResponseResult {
+        result: PostTwoFactorDiagnosticResult,
+    },
+    TransitionToNeedsDevice2FA {
+        preceding_stage: PostTwoFactorLoginStage,
+    },
+}
+
+pub type PostTwoFactorDiagnosticSink = Arc<dyn Fn(PostTwoFactorDiagnosticEvent) + Send + Sync>;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustedNumber {
@@ -83,6 +125,209 @@ pub struct SMSTwoFactorError {
     pub code: String,
     pub title: String,
     pub message: String,
+}
+
+fn emit_post_two_factor_diagnostic(
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+    event: PostTwoFactorDiagnosticEvent,
+) {
+    if let Some(sink) = sink {
+        sink(event);
+    }
+}
+
+fn post_two_factor_result_from_report(report: &Report) -> PostTwoFactorDiagnosticResult {
+    for cause in report.as_ref().iter_reports() {
+        if let Some(error) = cause.downcast_current_context::<SideloadError>()
+            && let SideloadError::AuthWithMessage(code, _) = error
+        {
+            return PostTwoFactorDiagnosticResult::AppleServiceCode(*code);
+        }
+        if let Some(error) = cause.downcast_current_context::<reqwest::Error>()
+            && let Some(status) = error.status()
+        {
+            return PostTwoFactorDiagnosticResult::HttpStatus(status.as_u16());
+        }
+    }
+    PostTwoFactorDiagnosticResult::TransportFailure
+}
+
+fn emit_post_two_factor_login_begin(
+    stage: PostTwoFactorLoginStage,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+) {
+    let event = match stage {
+        PostTwoFactorLoginStage::InitialLogin => {
+            PostTwoFactorDiagnosticEvent::PostTwoFactorInitialLoginBegin
+        }
+        PostTwoFactorLoginStage::ProofLogin => {
+            PostTwoFactorDiagnosticEvent::PostTwoFactorProofLoginBegin
+        }
+    };
+    emit_post_two_factor_diagnostic(sink, event);
+}
+
+fn emit_post_two_factor_login_response_result(
+    stage: PostTwoFactorLoginStage,
+    result: PostTwoFactorDiagnosticResult,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+) {
+    let event = match stage {
+        PostTwoFactorLoginStage::InitialLogin => {
+            PostTwoFactorDiagnosticEvent::PostTwoFactorInitialLoginResponseResult { result }
+        }
+        PostTwoFactorLoginStage::ProofLogin => {
+            PostTwoFactorDiagnosticEvent::PostTwoFactorProofLoginResponseResult { result }
+        }
+    };
+    emit_post_two_factor_diagnostic(sink, event);
+}
+
+fn classify_post_two_factor_login_state(
+    status: &Dictionary,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+) -> LoginState {
+    if let Some(plist::Value::String(s)) = status.get("au") {
+        return match s.as_str() {
+            "trustedDeviceSecondaryAuth" => {
+                emit_post_two_factor_diagnostic(
+                    sink,
+                    PostTwoFactorDiagnosticEvent::TransitionToNeedsDevice2FA {
+                        preceding_stage: PostTwoFactorLoginStage::ProofLogin,
+                    },
+                );
+                LoginState::NeedsDevice2FA
+            }
+            "secondaryAuth" => LoginState::NeedsSMS2FA(1),
+            "repair" => LoginState::LoggedIn,
+            unknown => LoginState::NeedsExtraStep(unknown.to_string()),
+        };
+    }
+    LoginState::LoggedIn
+}
+
+fn classify_login_response(
+    stage: PostTwoFactorLoginStage,
+    response: Result<Dictionary, Report>,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+    request_context: &'static str,
+    response_context: &'static str,
+) -> Result<Dictionary, Report> {
+    let response = match response {
+        Ok(response) => response,
+        Err(report) => {
+            let report = report.context(request_context).into_dynamic();
+            emit_post_two_factor_login_response_result(
+                stage,
+                post_two_factor_result_from_report(&report),
+                sink,
+            );
+            return Err(report);
+        }
+    };
+    match response.check_grandslam_error() {
+        Ok(response) => {
+            emit_post_two_factor_login_response_result(
+                stage,
+                PostTwoFactorDiagnosticResult::Success,
+                sink,
+            );
+            Ok(response)
+        }
+        Err(report) => {
+            let report = report.context(response_context).into_dynamic();
+            emit_post_two_factor_login_response_result(
+                stage,
+                post_two_factor_result_from_report(&report),
+                sink,
+            );
+            Err(report)
+        }
+    }
+}
+
+fn classify_trusted_device_response(
+    res: Result<Dictionary, Report>,
+    last_error: &mut Option<String>,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+) -> Result<LoginState, Report> {
+    if let Err(report) = &res {
+        for cause in report.as_ref().iter_reports() {
+            if let Some(SideloadError::AuthWithMessage(code, message)) =
+                cause.downcast_current_context::<SideloadError>()
+                && *code == -21669
+            {
+                warn!("{} - {}", code, message);
+                *last_error = format!("{} - {}", code, message).into();
+                emit_post_two_factor_diagnostic(
+                    sink,
+                    PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyRejected {
+                        apple_service_code: *code,
+                    },
+                );
+                emit_post_two_factor_diagnostic(
+                    sink,
+                    PostTwoFactorDiagnosticEvent::TransitionToNeedsDevice2FAVerification,
+                );
+                return Ok(LoginState::NeedsDevice2FAVerification);
+            }
+        }
+    }
+
+    match res {
+        Ok(_) => {
+            emit_post_two_factor_diagnostic(
+                sink,
+                PostTwoFactorDiagnosticEvent::TrustedDeviceVerifySuccess,
+            );
+            emit_post_two_factor_diagnostic(
+                sink,
+                PostTwoFactorDiagnosticEvent::TransitionToNeedsLogin,
+            );
+            debug!("Trusted device 2FA completed, need to login again");
+            Ok(LoginState::NeedsLogin)
+        }
+        Err(report) => {
+            emit_post_two_factor_diagnostic(
+                sink,
+                PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyFailure {
+                    result: post_two_factor_result_from_report(&report),
+                },
+            );
+            Err(report)
+        }
+    }
+}
+
+fn classify_trusted_device_request<T>(
+    result: Result<T, Report>,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+) -> Result<T, Report> {
+    if let Err(report) = &result {
+        emit_post_two_factor_diagnostic(
+            sink,
+            PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyFailure {
+                result: post_two_factor_result_from_report(report),
+            },
+        );
+    }
+    result
+}
+
+fn classify_trusted_device_failure<T>(
+    result: Result<T, Report>,
+    sink: Option<&PostTwoFactorDiagnosticSink>,
+    diagnostic_result: PostTwoFactorDiagnosticResult,
+) -> Result<T, Report> {
+    if result.is_err() {
+        emit_post_two_factor_diagnostic(
+            sink,
+            PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyFailure {
+                result: diagnostic_result,
+            },
+        );
+    }
+    result
 }
 
 impl AppleAccount {
@@ -146,7 +391,7 @@ impl AppleAccount {
         C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
         Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>>,
     {
-        self.login_impl(password, two_factor_callback).await
+        self.login_impl(password, two_factor_callback, None).await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -159,13 +404,44 @@ impl AppleAccount {
         C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
         Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>> + Send,
     {
-        self.login_impl(password, two_factor_callback).await
+        self.login_impl(password, two_factor_callback, None).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn login_with_diagnostics<C, Fut>(
+        &mut self,
+        password: &str,
+        two_factor_callback: C,
+        diagnostic_sink: PostTwoFactorDiagnosticSink,
+    ) -> Result<(), Report>
+    where
+        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>>,
+    {
+        self.login_impl(password, two_factor_callback, Some(&diagnostic_sink))
+            .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn login_with_diagnostics<C, Fut>(
+        &mut self,
+        password: &str,
+        two_factor_callback: C,
+        diagnostic_sink: PostTwoFactorDiagnosticSink,
+    ) -> Result<(), Report>
+    where
+        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>> + Send,
+    {
+        self.login_impl(password, two_factor_callback, Some(&diagnostic_sink))
+            .await
     }
 
     async fn login_impl<C, Fut>(
         &mut self,
         password: &str,
         two_factor_callback: C,
+        diagnostic_sink: Option<&PostTwoFactorDiagnosticSink>,
     ) -> Result<(), Report>
     where
         C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
@@ -177,7 +453,7 @@ impl AppleAccount {
         }
 
         self.login_state = self
-            .login_inner(password)
+            .login_inner(password, None)
             .await
             .context("Failed to log in to Apple ID")?;
 
@@ -220,7 +496,7 @@ impl AppleAccount {
                     match response {
                         TwoFactorCallbackResponse::SubmitCode(code) => {
                             self.login_state = self
-                                .verify_trusted_device_2fa(code)
+                                .verify_trusted_device_2fa(code, diagnostic_sink)
                                 .await
                                 .context("Failed to verify trusted device 2FA")?;
                         }
@@ -287,7 +563,7 @@ impl AppleAccount {
                 LoginState::NeedsLogin => {
                     debug!("Logging in again...");
                     self.login_state = self
-                        .login_inner(password)
+                        .login_inner(password, diagnostic_sink)
                         .await
                         .context("Failed to login again")?;
                 }
@@ -377,59 +653,75 @@ impl AppleAccount {
         Ok(())
     }
 
-    async fn verify_trusted_device_2fa(&mut self, code: String) -> Result<LoginState, Report> {
-        let anisette_data = self
-            .anisette_generator
-            .get_anisette_data(self.grandslam_client.clone())
-            .await
-            .context("Failed to get anisette data for 2FA")?;
+    async fn verify_trusted_device_2fa(
+        &mut self,
+        code: String,
+        diagnostic_sink: Option<&PostTwoFactorDiagnosticSink>,
+    ) -> Result<LoginState, Report> {
+        emit_post_two_factor_diagnostic(
+            diagnostic_sink,
+            PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyBegin,
+        );
+        let anisette_data = classify_trusted_device_request(
+            self.anisette_generator
+                .get_anisette_data(self.grandslam_client.clone())
+                .await
+                .context("Failed to get anisette data for 2FA")
+                .map_err(|report| report.into_dynamic()),
+            diagnostic_sink,
+        )?;
 
-        let submit_code_url = self.grandslam_client.get_url("validateCode")?;
+        let submit_code_url = classify_trusted_device_request(
+            self.grandslam_client.get_url("validateCode"),
+            diagnostic_sink,
+        )?;
 
-        let res = self
-            .grandslam_client
-            .get(&submit_code_url)?
-            .headers(self.build_2fa_headers(&anisette_data).await?)
+        let request = classify_trusted_device_request(
+            self.grandslam_client.get(&submit_code_url),
+            diagnostic_sink,
+        )?;
+        let headers = classify_trusted_device_request(
+            self.build_2fa_headers(&anisette_data).await,
+            diagnostic_sink,
+        )?;
+
+        let response = request
+            .headers(headers)
             .header("security-code", code)
             .send()
             .await
-            .context("Failed to submit trusted device 2fa code")?
-            .error_for_status()
-            .context("Trusted device 2FA code submission failed")?
-            .text()
-            .await
-            .context("Failed to read trusted device 2FA response text")?;
+            .context("Failed to submit trusted device 2FA code")
+            .map_err(|report| report.into_dynamic());
+        let response = classify_trusted_device_request(response, diagnostic_sink)?;
+        let response = classify_trusted_device_request(
+            response
+                .error_for_status()
+                .context("Trusted device 2FA code submission failed")
+                .map_err(|report| report.into_dynamic()),
+            diagnostic_sink,
+        )?;
+        let res = classify_trusted_device_failure(
+            response
+                .text()
+                .await
+                .context("Failed to read trusted device 2FA response text")
+                .map_err(|report| report.into_dynamic()),
+            diagnostic_sink,
+            PostTwoFactorDiagnosticResult::ResponseBodyFailure,
+        )?;
 
-        let plist: Dictionary = plist::from_bytes(res.as_bytes())
-            .context("Failed to parse trusted device response plist")
-            .attach_with(|| res.clone())?;
+        let plist: Dictionary = classify_trusted_device_failure(
+            plist::from_bytes(res.as_bytes())
+                .context("Failed to parse trusted device response plist")
+                .map_err(|report| report.into_dynamic()),
+            diagnostic_sink,
+            PostTwoFactorDiagnosticResult::PlistParseFailure,
+        )?;
         let res = plist
             .check_grandslam_error()
-            .context("Trusted device 2FA rejected");
-        if let Err(ref report) = res {
-            for cause in report.iter_reports() {
-                if let Some(err) = cause.downcast_current_context::<SideloadError>() {
-                    match err {
-                        &SideloadError::AuthWithMessage(code, ref message) => match code {
-                            // Incorrect Verification Code, let the user try again
-                            -21669 => {
-                                warn!("{} - {}", code, message);
-                                self.last_error = format!("{} - {}", code, message).into();
-
-                                return Ok(LoginState::NeedsDevice2FAVerification);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                }
-            }
-        }
-        res?;
-
-        debug!("Trusted device 2FA completed, need to login again");
-
-        Ok(LoginState::NeedsLogin)
+            .context("Trusted device 2FA rejected")
+            .map_err(|report| report.into_dynamic());
+        classify_trusted_device_response(res, &mut self.last_error, diagnostic_sink)
     }
 
     async fn send_sms_2fa(&mut self, id: u32) -> Result<LoginState, Report> {
@@ -672,7 +964,12 @@ impl AppleAccount {
         Ok(headers)
     }
 
-    async fn login_inner(&mut self, password: &str) -> Result<LoginState, Report> {
+    async fn login_inner(
+        &mut self,
+        password: &str,
+        diagnostic_sink: Option<&PostTwoFactorDiagnosticSink>,
+    ) -> Result<LoginState, Report> {
+        emit_post_two_factor_login_begin(PostTwoFactorLoginStage::InitialLogin, diagnostic_sink);
         let anisette_data = self
             .anisette_generator
             .get_anisette_data(self.grandslam_client.clone())
@@ -706,13 +1003,15 @@ impl AppleAccount {
 
         debug!("Sending initial login request");
 
-        let response = self
-            .grandslam_client
-            .plist_request(&gs_service_url, &req1, None)
-            .await
-            .context("Failed to send initial login request")?
-            .check_grandslam_error()
-            .context("GrandSlam error during initial login request")?;
+        let response = classify_login_response(
+            PostTwoFactorLoginStage::InitialLogin,
+            self.grandslam_client
+                .plist_request(&gs_service_url, &req1, None)
+                .await,
+            diagnostic_sink,
+            "Failed to send initial login request",
+            "GrandSlam error during initial login request",
+        )?;
 
         debug!("Login step 1 completed");
 
@@ -770,18 +1069,20 @@ impl AppleAccount {
             }
         });
 
-        debug!("Sending proof login request");
-
         let mut close_headers = HeaderMap::new();
         close_headers.insert("Connection", HeaderValue::from_static("close"));
 
-        let response2 = self
-            .grandslam_client
-            .plist_request(&gs_service_url, &req2, Some(close_headers))
-            .await
-            .context("Failed to send proof login request")?
-            .check_grandslam_error()
-            .context("GrandSlam error during proof login request")?;
+        emit_post_two_factor_login_begin(PostTwoFactorLoginStage::ProofLogin, diagnostic_sink);
+
+        let response2 = classify_login_response(
+            PostTwoFactorLoginStage::ProofLogin,
+            self.grandslam_client
+                .plist_request(&gs_service_url, &req2, Some(close_headers))
+                .await,
+            diagnostic_sink,
+            "Failed to send proof login request",
+            "GrandSlam error during proof login request",
+        )?;
 
         debug!("Login step 2 response received, verifying server proof");
 
@@ -811,18 +1112,10 @@ impl AppleAccount {
 
         debug!("Login step 2 completed");
 
-        if let Some(plist::Value::String(s)) = status.get("au") {
-            return Ok(match s.as_str() {
-                "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
-                "secondaryAuth" => LoginState::NeedsSMS2FA(
-                    1, /* Just start by trying 1, user can correct after */
-                ),
-                "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
-                unknown => LoginState::NeedsExtraStep(unknown.to_string()),
-            });
-        }
-
-        Ok(LoginState::LoggedIn)
+        Ok(classify_post_two_factor_login_state(
+            status,
+            diagnostic_sink,
+        ))
     }
 
     pub async fn get_app_token(&mut self, app: &str) -> Result<AppToken, Report> {
@@ -1031,5 +1324,214 @@ fn censor_email(email: &str) -> String {
         }
     } else {
         "***".to_string()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trusted_device_response(code: Option<i64>) -> Result<Dictionary, Report> {
+        let mut response = Dictionary::new();
+        if let Some(code) = code {
+            let mut status = Dictionary::new();
+            status.insert("ec".into(), plist::Value::Integer(code.into()));
+            status.insert(
+                "em".into(),
+                plist::Value::String("test trusted-device failure".into()),
+            );
+            response.insert("Status".into(), plist::Value::Dictionary(status));
+        }
+        response
+            .check_grandslam_error()
+            .map_err(|report| report.into_dynamic())
+    }
+
+    fn diagnostic_sink() -> (
+        PostTwoFactorDiagnosticSink,
+        Arc<tokio::sync::Mutex<Vec<PostTwoFactorDiagnosticEvent>>>,
+    ) {
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        let sink: PostTwoFactorDiagnosticSink = Arc::new(move |event| {
+            sink_events
+                .try_lock()
+                .expect("diagnostic test history is not locked")
+                .push(event);
+        });
+        (sink, events)
+    }
+
+    #[test]
+    fn trusted_device_success_reports_login_transition() {
+        let (sink, events) = diagnostic_sink();
+        let mut last_error = None;
+        let state = classify_trusted_device_response(
+            trusted_device_response(None),
+            &mut last_error,
+            Some(&sink),
+        )
+        .expect("trusted-device success should classify");
+
+        assert!(matches!(state, LoginState::NeedsLogin));
+        assert!(last_error.is_none());
+        assert_eq!(
+            *events
+                .try_lock()
+                .expect("diagnostic test history is not locked"),
+            vec![
+                PostTwoFactorDiagnosticEvent::TrustedDeviceVerifySuccess,
+                PostTwoFactorDiagnosticEvent::TransitionToNeedsLogin,
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_device_incorrect_code_reports_retry_state_without_resubmission() {
+        let (sink, events) = diagnostic_sink();
+        let mut last_error = None;
+        let state = classify_trusted_device_response(
+            trusted_device_response(Some(-21669)),
+            &mut last_error,
+            Some(&sink),
+        )
+        .expect("incorrect trusted-device code should classify");
+
+        assert!(matches!(state, LoginState::NeedsDevice2FAVerification));
+        assert_eq!(
+            last_error.as_deref(),
+            Some("-21669 - test trusted-device failure")
+        );
+        assert_eq!(
+            *events
+                .try_lock()
+                .expect("diagnostic test history is not locked"),
+            vec![
+                PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyRejected {
+                    apple_service_code: -21669,
+                },
+                PostTwoFactorDiagnosticEvent::TransitionToNeedsDevice2FAVerification,
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_device_other_failure_reports_typed_terminal_result() {
+        let (sink, events) = diagnostic_sink();
+        let mut last_error = None;
+        let result = classify_trusted_device_response(
+            trusted_device_response(Some(-22406)),
+            &mut last_error,
+            Some(&sink),
+        );
+
+        assert!(result.is_err());
+        assert!(last_error.is_none());
+        assert_eq!(
+            *events
+                .try_lock()
+                .expect("diagnostic test history is not locked"),
+            vec![PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyFailure {
+                result: PostTwoFactorDiagnosticResult::AppleServiceCode(-22406),
+            }]
+        );
+    }
+
+    #[test]
+    fn post_two_factor_request_stages_report_success_and_http_failure() {
+        let (sink, events) = diagnostic_sink();
+        emit_post_two_factor_login_begin(PostTwoFactorLoginStage::InitialLogin, Some(&sink));
+        let initial = classify_login_response(
+            PostTwoFactorLoginStage::InitialLogin,
+            Ok(Dictionary::new()),
+            Some(&sink),
+            "initial request failed",
+            "initial response failed",
+        )
+        .expect("initial login response should classify");
+
+        emit_post_two_factor_login_begin(PostTwoFactorLoginStage::ProofLogin, Some(&sink));
+        emit_post_two_factor_login_response_result(
+            PostTwoFactorLoginStage::ProofLogin,
+            PostTwoFactorDiagnosticResult::HttpStatus(503),
+            Some(&sink),
+        );
+
+        assert!(initial.is_empty());
+        assert_eq!(
+            *events
+                .try_lock()
+                .expect("diagnostic test history is not locked"),
+            vec![
+                PostTwoFactorDiagnosticEvent::PostTwoFactorInitialLoginBegin,
+                PostTwoFactorDiagnosticEvent::PostTwoFactorInitialLoginResponseResult {
+                    result: PostTwoFactorDiagnosticResult::Success,
+                },
+                PostTwoFactorDiagnosticEvent::PostTwoFactorProofLoginBegin,
+                PostTwoFactorDiagnosticEvent::PostTwoFactorProofLoginResponseResult {
+                    result: PostTwoFactorDiagnosticResult::HttpStatus(503),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn post_login_two_factor_response_reports_callback_reentry() {
+        let (sink, events) = diagnostic_sink();
+        let mut status = Dictionary::new();
+        status.insert(
+            "au".into(),
+            plist::Value::String("trustedDeviceSecondaryAuth".into()),
+        );
+
+        let state = classify_post_two_factor_login_state(&status, Some(&sink));
+
+        assert!(matches!(state, LoginState::NeedsDevice2FA));
+        assert_eq!(
+            *events
+                .try_lock()
+                .expect("diagnostic test history is not locked"),
+            vec![PostTwoFactorDiagnosticEvent::TransitionToNeedsDevice2FA {
+                preceding_stage: PostTwoFactorLoginStage::ProofLogin,
+            }]
+        );
+    }
+
+    #[test]
+    fn trusted_device_body_and_plist_failures_report_distinct_results() {
+        let (sink, events) = diagnostic_sink();
+        let body_error: Result<(), Report> =
+            Err(Report::new(std::io::Error::other("response body failed")).into_dynamic());
+        let plist_error: Result<(), Report> =
+            Err(Report::new(std::io::Error::other("plist parse failed")).into_dynamic());
+
+        assert!(
+            classify_trusted_device_failure(
+                body_error,
+                Some(&sink),
+                PostTwoFactorDiagnosticResult::ResponseBodyFailure,
+            )
+            .is_err()
+        );
+        assert!(
+            classify_trusted_device_failure(
+                plist_error,
+                Some(&sink),
+                PostTwoFactorDiagnosticResult::PlistParseFailure,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            *events
+                .try_lock()
+                .expect("diagnostic test history is not locked"),
+            vec![
+                PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyFailure {
+                    result: PostTwoFactorDiagnosticResult::ResponseBodyFailure,
+                },
+                PostTwoFactorDiagnosticEvent::TrustedDeviceVerifyFailure {
+                    result: PostTwoFactorDiagnosticResult::PlistParseFailure,
+                },
+            ]
+        );
     }
 }

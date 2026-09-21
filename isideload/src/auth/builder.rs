@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use rootcause::prelude::*;
@@ -5,7 +6,10 @@ use tokio::sync::RwLock;
 
 use crate::{
     anisette::{AnisetteDataGenerator, AnisetteProvider, remote_v3::RemoteV3AnisetteProvider},
-    auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
+    auth::apple_account::{
+        AppleAccount, PostTwoFactorDiagnosticSink, TwoFactorCallbackParams,
+        TwoFactorCallbackResponse,
+    },
 };
 
 pub struct AppleAccountBuilder {
@@ -104,6 +108,44 @@ impl AppleAccountBuilder {
     {
         let mut account = self.build().await?;
         account.login(password, two_factor_callback).await?;
+        Ok(account)
+    }
+
+    /// Build the AppleAccount and log in while emitting typed post-two-factor diagnostics.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn login_with_diagnostics<C, Fut>(
+        self,
+        password: &str,
+        two_factor_callback: C,
+        diagnostic_sink: PostTwoFactorDiagnosticSink,
+    ) -> Result<AppleAccount, Report>
+    where
+        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>>,
+    {
+        let mut account = self.build().await?;
+        account
+            .login_with_diagnostics(password, two_factor_callback, diagnostic_sink)
+            .await?;
+        Ok(account)
+    }
+
+    /// Build the AppleAccount and log in while emitting typed post-two-factor diagnostics.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn login_with_diagnostics<C, Fut>(
+        self,
+        password: &str,
+        two_factor_callback: C,
+        diagnostic_sink: PostTwoFactorDiagnosticSink,
+    ) -> Result<AppleAccount, Report>
+    where
+        C: Fn(TwoFactorCallbackParams) -> Fut + Send + Sync,
+        Fut: Future<Output = Result<TwoFactorCallbackResponse, Report>> + Send,
+    {
+        let mut account = self.build().await?;
+        account
+            .login_with_diagnostics(password, two_factor_callback, diagnostic_sink)
+            .await?;
         Ok(account)
     }
 }
