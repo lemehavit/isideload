@@ -50,7 +50,7 @@ impl DeveloperSession {
 
     pub async fn from_account(account: &mut AppleAccount) -> Result<Self, Report> {
         let token = account
-            .get_app_token("xcode.auth")
+            .get_xcode_app_token()
             .await
             .context("Failed to get xcode token from Apple account")?;
 
@@ -105,7 +105,7 @@ impl DeveloperSession {
 
         let text = self
             .client
-            .post(url)?
+            .post_developer(url)?
             .body(plist_to_xml_string(&body))
             .headers(
                 self.get_headers()

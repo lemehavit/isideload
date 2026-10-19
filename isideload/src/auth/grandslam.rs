@@ -17,9 +17,15 @@ use crate::sideload::cert_identity::APPLE_ROOT;
 use crate::{SideloadError, anisette::AnisetteClientInfo, util::plist::PlistDataExtract};
 
 const URL_BAG: &str = "https://gsa.apple.com/grandslam/GsService2/lookup";
+// The Android AuthKit identity used for the -80045 workaround receives a
+// provisioning-incompatible URL bag. Upstream uses this Mac/AuthKit identity
+// for discovery only, while subsequent GrandSlam calls keep Android identity.
+const URL_BAG_CLIENT_INFO: &str =
+    "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 
 pub struct GrandSlam {
     pub client: reqwest_middleware::ClientWithMiddleware,
+    developer_client: reqwest_middleware::ClientWithMiddleware,
     pub client_info: AnisetteClientInfo,
     url_bag: Dictionary,
 }
@@ -35,11 +41,14 @@ impl GrandSlam {
         proxy_url: Option<String>,
     ) -> Result<Self, Report> {
         let client =
-            Self::build_reqwest_client(debug, proxy_url).context("Failed to build HTTP client")?;
+            Self::build_reqwest_client(debug, proxy_url.clone()).context("Failed to build HTTP client")?;
+        let developer_client = Self::build_developer_client(proxy_url)
+            .context("Failed to build Developer Services HTTP client")?;
         let base_headers = Self::base_headers(&client_info, false)?;
         let url_bag = Self::fetch_url_bag(&client, base_headers).await?;
         Ok(Self {
             client,
+            developer_client,
             client_info,
             url_bag,
         })
@@ -48,9 +57,13 @@ impl GrandSlam {
     /// Fetch the URL bag from GrandSlam and cache it
     pub async fn fetch_url_bag(
         client: &reqwest_middleware::ClientWithMiddleware,
-        base_headers: HeaderMap,
+        mut base_headers: HeaderMap,
     ) -> Result<Dictionary, Report> {
         debug!("Fetching URL bag from GrandSlam");
+        base_headers.insert(
+            "X-Mme-Client-Info",
+            HeaderValue::from_str(URL_BAG_CLIENT_INFO)?,
+        );
         let resp = client
             .get(URL_BAG)
             .headers(base_headers)
@@ -116,6 +129,48 @@ impl GrandSlam {
         Ok(builder)
     }
 
+    pub fn post_developer(&self, url: &str) -> Result<reqwest_middleware::RequestBuilder, Report> {
+        if !Self::developer_url_is_allowed(url) {
+            bail!("Developer Services endpoint is not allowed");
+        }
+        Ok(self
+            .developer_client
+            .post(url)
+            .headers(Self::base_headers(&self.client_info, false)?))
+    }
+
+    fn developer_url_is_allowed(value: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(value) else { return false; };
+        url.scheme() == "https"
+            && url.host_str() == Some("developerservices2.apple.com")
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path().starts_with("/services/")
+    }
+
+    fn build_developer_client(
+        proxy_url: Option<String>,
+    ) -> Result<reqwest_middleware::ClientWithMiddleware, Report> {
+        // Developer Services uses a public PKI chain, unlike GrandSlam's
+        // private Apple root. Keep these trust policies on separate clients.
+        #[cfg(not(feature = "wasm"))]
+        let client = ClientBuilder::new()
+            .http1_title_case_headers()
+            .pool_max_idle_per_host(0)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        #[cfg(feature = "wasm")]
+        let client = ClientBuilder::new().build()?;
+        let builder = MwClientBuilder::new(client);
+        let builder = if let Some(proxy_url) = proxy_url {
+            builder.with(WasmProxyMiddleware::new(proxy_url))
+        } else {
+            builder
+        };
+        Ok(builder.build())
+    }
+
     pub fn post_sms(&self, url: &str) -> Result<reqwest_middleware::RequestBuilder, Report> {
         let builder = self
             .client
@@ -126,8 +181,12 @@ impl GrandSlam {
     }
 
     pub fn patch(&self, url: &str) -> Result<reqwest_middleware::RequestBuilder, Report> {
-        let builder = self
-            .client
+        let client = if Self::developer_url_is_allowed(url) {
+            &self.developer_client
+        } else {
+            &self.client
+        };
+        let builder = client
             .patch(url)
             .headers(Self::base_headers(&self.client_info, false)?);
 
@@ -197,6 +256,10 @@ impl GrandSlam {
             "X-Apple-App-Info",
             HeaderValue::from_static("com.apple.gs.xcode.auth"),
         );
+        headers.insert(
+            reqwest::header::CONNECTION,
+            HeaderValue::from_static("close"),
+        );
 
         Ok(headers)
     }
@@ -215,7 +278,11 @@ impl GrandSlam {
         let cert = Certificate::from_der(APPLE_ROOT)?;
         #[cfg(not(feature = "wasm"))]
         let client = ClientBuilder::new()
-            .add_root_certificate(cert)
+            // GrandSlam presents Apple's private PKI chain. Using the platform
+            // verifier here still rejects the embedded Apple root on Debian.
+            // Restrict this client to the pinned, repository-shipped Apple root
+            // instead of changing the host-wide trust store.
+            .tls_certs_only([cert])
             .http1_title_case_headers()
             .danger_accept_invalid_certs(debug)
             .connection_verbose(debug)
@@ -253,5 +320,75 @@ impl GrandSlamErrorChecker for Dictionary {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn developer_requests_accept_only_the_https_developer_services_origin() {
+        assert!(GrandSlam::developer_url_is_allowed(
+            "https://developerservices2.apple.com/services/QH65B2/listTeams.action?clientId=XABBG36SBA"
+        ));
+        for denied in [
+            "http://developerservices2.apple.com/services/QH65B2/listTeams.action",
+            "https://gsa.apple.com/services/QH65B2/listTeams.action",
+            "https://developerservices2.apple.com.example.org/services/QH65B2/listTeams.action",
+            "https://user@developerservices2.apple.com/services/QH65B2/listTeams.action",
+            "https://developerservices2.apple.com:444/services/QH65B2/listTeams.action",
+        ] {
+            assert!(!GrandSlam::developer_url_is_allowed(denied));
+        }
+    }
+
+    #[test]
+    #[ignore = "performs only an unauthenticated public HEAD request to Developer Services"]
+    fn developer_public_tls_uses_public_roots_without_account_credentials() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(async {
+                let client = GrandSlam::build_developer_client(None).expect("public-trust client");
+                client
+                    .head("https://developerservices2.apple.com/")
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await
+                    .expect("Developer Services public TLS certificate must validate");
+            });
+    }
+
+    #[test]
+    #[ignore = "contacts only Apple's public GrandSlam URL-bag endpoint"]
+    fn public_url_bag_accepts_pinned_apple_root() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+            let client_info = AnisetteClientInfo {
+                client_info:
+                    "<Pixel 7> <Android;14;UQ1A.240205.002> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                        .to_string(),
+                user_agent: "akd/1.0 CFNetwork/808.1.4".to_string(),
+            };
+
+            let grand_slam = GrandSlam::new(client_info, false, None)
+                .await
+                .expect("the pinned Apple root should validate the public GrandSlam URL bag");
+            assert!(grand_slam.get_url("gsService").is_ok());
+        });
+    }
+
+    #[test]
+    fn url_bag_identity_is_separate_from_android_login_identity() {
+        assert!(URL_BAG_CLIENT_INFO.contains("Mac15,7"));
+        assert!(URL_BAG_CLIENT_INFO.contains("com.apple.AuthKit/1"));
+        assert!(!URL_BAG_CLIENT_INFO.contains("Android"));
     }
 }

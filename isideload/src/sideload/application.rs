@@ -230,8 +230,8 @@ impl Application {
 
         for bundle in app_ids_to_register {
             let id = bundle.bundle_identifier().unwrap_or("");
-            let name = bundle.bundle_name().unwrap_or("");
-            dev_session.add_app_id(team, name, id, None).await?;
+            let name = developer_portal_name(bundle.bundle_name().unwrap_or(""));
+            dev_session.add_app_id(team, &name, id, None).await?;
         }
         let list_app_id_response = dev_session.list_app_ids(team, None).await?;
         let app_ids: Vec<_> = list_app_id_response
@@ -308,6 +308,44 @@ impl Application {
             }
         }
         Ok(())
+    }
+}
+
+/// Apple's developer portal rejects App ID and app group names containing
+/// anything other than ASCII letters, digits and spaces (result code 35), e.g.
+/// a `CFBundleName` of `hello_world`. Strip those characters like AltSign does.
+pub(crate) fn developer_portal_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "App".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod developer_portal_name_tests {
+    use super::developer_portal_name;
+
+    #[test]
+    fn strips_characters_apple_rejects() {
+        assert_eq!(developer_portal_name("hello_world"), "helloworld");
+        assert_eq!(developer_portal_name("My App-2.0"), "My App20");
+        assert_eq!(
+            developer_portal_name("RSD Wireless Test"),
+            "RSD Wireless Test"
+        );
+    }
+
+    #[test]
+    fn never_returns_an_empty_name() {
+        assert_eq!(developer_portal_name(""), "App");
+        assert_eq!(developer_portal_name("_-."), "App");
+        assert_eq!(developer_portal_name("äö"), "App");
     }
 }
 

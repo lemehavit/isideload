@@ -35,6 +35,7 @@ pub struct AppleAccount {
     login_state: LoginState,
     debug: bool,
     last_error: Option<String>,
+    preflight_xcode_token: Option<AppToken>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +128,23 @@ pub struct SMSTwoFactorError {
     pub message: String,
 }
 
+fn resync_sim(response: &Dictionary) -> Option<String> {
+    let status = response.get("Status")?.as_dictionary()?;
+    if status
+        .get("hsc")
+        .and_then(plist::Value::as_signed_integer)
+        != Some(434)
+    {
+        return None;
+    }
+
+    match status.get("X-Apple-I-MD-DATA")? {
+        plist::Value::Data(data) => Some(BASE64_STANDARD.encode(data)),
+        plist::Value::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 fn emit_post_two_factor_diagnostic(
     sink: Option<&PostTwoFactorDiagnosticSink>,
     event: PostTwoFactorDiagnosticEvent,
@@ -150,6 +168,15 @@ fn post_two_factor_result_from_report(report: &Report) -> PostTwoFactorDiagnosti
         }
     }
     PostTwoFactorDiagnosticResult::TransportFailure
+}
+
+fn report_has_apple_service_code(report: &Report, expected: i64) -> bool {
+    report.as_ref().iter_reports().any(|cause| {
+        matches!(
+            cause.downcast_current_context::<SideloadError>(),
+            Some(SideloadError::AuthWithMessage(code, _)) if *code == expected
+        )
+    })
 }
 
 fn emit_post_two_factor_login_begin(
@@ -372,6 +399,7 @@ impl AppleAccount {
             login_state: LoginState::NeedsLogin,
             trusted_phone_numbers: None,
             last_error: None,
+            preflight_xcode_token: None,
         })
     }
 
@@ -453,7 +481,7 @@ impl AppleAccount {
         }
 
         self.login_state = self
-            .login_inner(password, None)
+            .login_inner(password, diagnostic_sink)
             .await
             .context("Failed to log in to Apple ID")?;
 
@@ -471,6 +499,24 @@ impl AppleAccount {
             }
             match self.login_state.clone() {
                 LoginState::LoggedIn => {
+                    if diagnostic_sink.is_some() && self.preflight_xcode_token.is_none() {
+                        match self.get_app_token("xcode.auth").await {
+                            Ok(token) => self.preflight_xcode_token = Some(token),
+                            Err(report) if report_has_apple_service_code(&report, -22411) => {
+                                emit_post_two_factor_diagnostic(
+                                    diagnostic_sink,
+                                    PostTwoFactorDiagnosticEvent::TransitionToNeedsDevice2FAVerification,
+                                );
+                                self.login_state = LoginState::NeedsDevice2FAVerification;
+                                continue;
+                            }
+                            Err(report) => {
+                                return Err(report
+                                    .context("Failed to validate Xcode app token after login")
+                                    .into_dynamic());
+                            }
+                        }
+                    }
                     info!("Successfully logged in to Apple ID");
                     return Ok(());
                 }
@@ -979,7 +1025,7 @@ impl AppleAccount {
         let gs_service_url = self.grandslam_client.get_url("gsService")?;
         debug!("GrandSlam service URL: {}", gs_service_url);
 
-        let cpd = anisette_data.get_client_provided_data();
+        let mut cpd = anisette_data.get_client_provided_data();
 
         let srp_client = srp::Client::<G2048, Sha256>::new_with_options(false);
         let a: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
@@ -990,7 +1036,7 @@ impl AppleAccount {
                 "Version": "1.0.1"
             },
             "Request": {
-                "A2k": a_pub, // A2k = client public ephemeral
+                "A2k": a_pub.clone(), // A2k = client public ephemeral
                 "cpd": cpd.clone(), // cpd = client provided data
                 "o": "init", // o = operation
                 "ps": [ // ps = protocols supported
@@ -1003,11 +1049,45 @@ impl AppleAccount {
 
         debug!("Sending initial login request");
 
+        let mut raw_response = self
+            .grandslam_client
+            .plist_request(&gs_service_url, &req1, None)
+            .await;
+
+        if let Ok(response) = &raw_response
+            && let Some(sim) = resync_sim(response)
+        {
+            debug!("Anisette resync required (hsc 434); syncing then retrying init");
+            let fresh_anisette = self
+                .anisette_generator
+                .resync(&sim)
+                .await
+                .context("Anisette resync failed")?;
+            cpd = fresh_anisette.get_client_provided_data();
+            let resynced_request = plist!(dict {
+                "Header": {
+                    "Version": "1.0.1"
+                },
+                "Request": {
+                    "A2k": a_pub,
+                    "cpd": cpd.clone(),
+                    "o": "init",
+                    "ps": [
+                        "s2k",
+                        "s2k_fo"
+                    ],
+                    "u": self.email.clone(),
+                }
+            });
+            raw_response = self
+                .grandslam_client
+                .plist_request(&gs_service_url, &resynced_request, None)
+                .await;
+        }
+
         let response = classify_login_response(
             PostTwoFactorLoginStage::InitialLogin,
-            self.grandslam_client
-                .plist_request(&gs_service_url, &req1, None)
-                .await,
+            raw_response,
             diagnostic_sink,
             "Failed to send initial login request",
             "GrandSlam error during initial login request",
@@ -1222,6 +1302,13 @@ impl AppleAccount {
         Ok(app_token)
     }
 
+    pub async fn get_xcode_app_token(&mut self) -> Result<AppToken, Report> {
+        if let Some(token) = self.preflight_xcode_token.take() {
+            return Ok(token);
+        }
+        self.get_app_token("xcode.auth").await
+    }
+
     fn create_session_key(usr: &ClientVerifier<Sha256>, name: &str) -> Result<Vec<u8>, Report> {
         Ok(Hmac::<Sha256>::new_from_slice(usr.key())?
             .chain_update(name.as_bytes())
@@ -1359,6 +1446,23 @@ mod tests {
                 .push(event);
         });
         (sink, events)
+    }
+
+    #[test]
+    fn xcode_token_minus_22411_requires_deferred_trusted_device_verification() {
+        let report = Report::new(SideloadError::AuthWithMessage(
+            -22411,
+            "test two-factor requirement".into(),
+        ))
+        .into_dynamic();
+        assert!(report_has_apple_service_code(&report, -22411));
+        assert!(!report_has_apple_service_code(&report, -22406));
+    }
+
+    #[test]
+    fn unrelated_failures_do_not_trigger_deferred_trusted_device_verification() {
+        let report = Report::new(std::io::Error::other("test transport failure")).into_dynamic();
+        assert!(!report_has_apple_service_code(&report, -22411));
     }
 
     #[test]
@@ -1533,5 +1637,26 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn anisette_resync_extracts_only_hsc_434_sim() {
+        let mut status = Dictionary::new();
+        status.insert("hsc".into(), plist::Value::Integer(434.into()));
+        status.insert(
+            "X-Apple-I-MD-DATA".into(),
+            plist::Value::Data(vec![0x01, 0x02, 0x03]),
+        );
+        let mut response = Dictionary::new();
+        response.insert("Status".into(), plist::Value::Dictionary(status));
+
+        assert_eq!(resync_sim(&response).as_deref(), Some("AQID"));
+
+        response
+            .get_mut("Status")
+            .and_then(plist::Value::as_dictionary_mut)
+            .expect("status dictionary")
+            .insert("hsc".into(), plist::Value::Integer(200.into()));
+        assert_eq!(resync_sim(&response), None);
     }
 }

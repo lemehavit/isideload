@@ -8,7 +8,7 @@ use crate::{
     },
     sideload::{
         TeamSelection,
-        application::{Application, SpecialApp},
+        application::{Application, SpecialApp, developer_portal_name},
         builder::MaxCertsBehavior,
         cert_identity::CertificateIdentity,
         sign,
@@ -23,6 +23,45 @@ use idevice::provider::IdeviceProvider;
 use plist::Dictionary;
 use rootcause::{option_ext::OptionExt, prelude::*};
 use tracing::info;
+
+/// Typed, non-secret context for callers that must not expose error reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SigningStage {
+    #[error("developer team")]
+    Team,
+    #[error("certificate identity")]
+    CertificateIdentity,
+    #[error("application input")]
+    ApplicationInput,
+    #[error("application identifiers")]
+    AppIdentifiers,
+    #[error("application groups")]
+    AppGroups,
+    #[error("bundle preparation")]
+    BundlePreparation,
+    #[error("provisioning profile")]
+    ProvisioningProfile,
+    #[error("bundle metadata")]
+    BundleMetadata,
+    #[error("code signing")]
+    CodeSigning,
+}
+
+impl SigningStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Team => "developerTeam",
+            Self::CertificateIdentity => "certificateIdentity",
+            Self::ApplicationInput => "applicationInput",
+            Self::AppIdentifiers => "appIdentifiers",
+            Self::AppGroups => "appGroups",
+            Self::BundlePreparation => "bundlePreparation",
+            Self::ProvisioningProfile => "provisioningProfile",
+            Self::BundleMetadata => "bundleMetadata",
+            Self::CodeSigning => "codeSigning",
+        }
+    }
+}
 
 pub struct Sideloader {
     team_selection: TeamSelection,
@@ -78,7 +117,7 @@ impl Sideloader {
     {
         let team = match team {
             Some(t) => t,
-            None => self.get_team().await?,
+            None => self.get_team().await.context(SigningStage::Team)?,
         };
         let cert_identity = CertificateIdentity::retrieve(
             &self.machine_name,
@@ -89,35 +128,43 @@ impl Sideloader {
             &self.max_certs_behavior,
         )
         .await
-        .context("Failed to retrieve certificate identity")?;
+        .context(SigningStage::CertificateIdentity)?;
 
         if let Some(callback) = &progress_callback {
             callback(0.1).await;
         }
 
-        let mut app = Application::new(app_path)?;
+        let mut app = Application::new(app_path).context(SigningStage::ApplicationInput)?;
         let special = app.get_special_app();
 
-        let main_bundle_id = app.main_bundle_id()?;
-        let main_app_name = app.main_app_name()?;
+        let main_bundle_id = app
+            .main_bundle_id()
+            .context(SigningStage::ApplicationInput)?;
+        let main_app_name = app
+            .main_app_name()
+            .context(SigningStage::ApplicationInput)?;
         let main_app_id_str = format!("{}.{}", main_bundle_id, team.team_id);
-        app.update_bundle_id(&main_bundle_id, &main_app_id_str)?;
+        app.update_bundle_id(&main_bundle_id, &main_app_id_str)
+            .context(SigningStage::AppIdentifiers)?;
         let mut app_ids = app
             .register_app_ids(
                 /*&self.extensions_behavior, */ &mut self.dev_session,
                 &team,
             )
-            .await?;
+            .await
+            .context(SigningStage::AppIdentifiers)?;
         let main_app_id = match app_ids
             .iter()
             .find(|app_id| app_id.identifier == main_app_id_str)
         {
             Some(id) => id,
             None => {
-                bail!(
+                return Err(report!(
                     "Main app ID {} not found in registered app IDs",
                     main_app_id_str
-                );
+                )
+                .context(SigningStage::AppIdentifiers)
+                .into_dynamic());
             }
         }
         .clone();
@@ -133,22 +180,31 @@ impl Sideloader {
 
         let app_group = self
             .dev_session
-            .ensure_app_group(&team, &main_app_name, &group_identifier, None)
-            .await?;
+            .ensure_app_group(
+                &team,
+                &developer_portal_name(&main_app_name),
+                &group_identifier,
+                None,
+            )
+            .await
+            .context(SigningStage::AppGroups)?;
 
         for app_id in app_ids.iter_mut() {
             app_id
                 .ensure_group_feature(&mut self.dev_session, &team)
-                .await?;
+                .await
+                .context(SigningStage::AppGroups)?;
 
             self.dev_session
                 .assign_app_group(&team, &app_group, app_id, None)
-                .await?;
+                .await
+                .context(SigningStage::AppGroups)?;
 
             if increased_memory_limit {
                 self.dev_session
                     .add_increased_memory_limit(&team, app_id)
-                    .await?;
+                    .await
+                    .context(SigningStage::AppGroups)?;
             }
         }
 
@@ -160,12 +216,13 @@ impl Sideloader {
 
         app.apply_special_app_behavior(&special, &group_identifier, &cert_identity)
             .await
-            .context("Failed to modify app bundle")?;
+            .context(SigningStage::BundlePreparation)?;
 
         let main_provisioning_profile = self
             .dev_session
             .download_team_provisioning_profile(&team, &main_app_id, None)
-            .await?;
+            .await
+            .context(SigningStage::ProvisioningProfile)?;
 
         let mut provisioning_profiles: Vec<(String, Profile, Dictionary)> = Vec::new();
 
@@ -179,12 +236,10 @@ impl Sideloader {
                 .dev_session
                 .download_team_provisioning_profile(&team, &id, None)
                 .await
-                .context(format!(
-                    "Failed to download provisioning profile for {}",
-                    bundle_id
-                ))?;
+                .context(SigningStage::ProvisioningProfile)?;
 
-            let parsed_profile = ProvisioningProfile::parse(profile.encoded_profile.as_ref())?;
+            let parsed_profile = ProvisioningProfile::parse(profile.encoded_profile.as_ref())
+                .context(SigningStage::ProvisioningProfile)?;
             let entitlements = parsed_profile.entitlements().clone();
 
             provisioning_profiles.push((bundle_id, profile, entitlements));
@@ -196,12 +251,14 @@ impl Sideloader {
 
         info!("Acquired provisioning profile");
 
-        app.bundle.write_info()?;
+        app.bundle
+            .write_info()
+            .context(SigningStage::BundleMetadata)?;
         for ext in app.bundle.app_extensions_mut() {
-            ext.write_info()?;
+            ext.write_info().context(SigningStage::BundleMetadata)?;
         }
         for ext in app.bundle.frameworks_mut() {
-            ext.write_info()?;
+            ext.write_info().context(SigningStage::BundleMetadata)?;
         }
 
         // isideload_vfs::fs::write(
@@ -223,7 +280,7 @@ impl Sideloader {
             progress_callback,
         )
         .await
-        .context("Failed to sign app")?;
+        .context(SigningStage::CodeSigning)?;
 
         info!("App signed!");
 
