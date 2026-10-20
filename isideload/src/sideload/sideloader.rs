@@ -3,6 +3,7 @@ use crate::{
         app_groups::AppGroupsApi,
         app_ids::{AppIdsApi, Profile},
         developer_session::DeveloperSession,
+        device_type::DeveloperDeviceType,
         devices::DevicesApi,
         teams::{DeveloperTeam, TeamsApi},
     },
@@ -115,6 +116,31 @@ impl Sideloader {
         F: Fn(f32) -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.sign_app_for_device_type(
+            app_path,
+            team,
+            increased_memory_limit,
+            None,
+            progress_callback,
+        )
+        .await
+    }
+
+    /// Like [`Self::sign_app`], but requests provisioning profiles for the given
+    /// device platform. `None` keeps the iOS behavior; pass
+    /// [`DeveloperDeviceType::Tvos`] when the target is an Apple TV.
+    pub async fn sign_app_for_device_type<F, Fut>(
+        &mut self,
+        app_path: PathBuf,
+        team: Option<DeveloperTeam>,
+        increased_memory_limit: bool,
+        device_type: Option<DeveloperDeviceType>,
+        progress_callback: Option<F>,
+    ) -> Result<(PathBuf, Option<SpecialApp>), Report>
+    where
+        F: Fn(f32) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         let team = match team {
             Some(t) => t,
             None => self.get_team().await.context(SigningStage::Team)?,
@@ -220,7 +246,7 @@ impl Sideloader {
 
         let main_provisioning_profile = self
             .dev_session
-            .download_team_provisioning_profile(&team, &main_app_id, None)
+            .download_team_provisioning_profile(&team, &main_app_id, device_type.clone())
             .await
             .context(SigningStage::ProvisioningProfile)?;
 
@@ -234,7 +260,7 @@ impl Sideloader {
 
             let profile = self
                 .dev_session
-                .download_team_provisioning_profile(&team, &id, None)
+                .download_team_provisioning_profile(&team, &id, device_type.clone())
                 .await
                 .context(SigningStage::ProvisioningProfile)?;
 

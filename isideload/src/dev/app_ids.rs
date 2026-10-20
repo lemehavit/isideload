@@ -1,7 +1,7 @@
 use crate::{
     dev::{
         developer_session::DeveloperSession,
-        device_type::{DeveloperDeviceType, dev_url},
+        device_type::{DeveloperDeviceType, dev_url, platform_fields},
         teams::DeveloperTeam,
     },
     util::plist::{PlistDataExtract, SensitivePlistAttachment},
@@ -156,10 +156,12 @@ pub trait AppIdsApi {
         app_id: &AppId,
         device_type: impl Into<Option<DeveloperDeviceType>> + Send,
     ) -> Result<Profile, Report> {
-        let body = plist!(dict {
+        let device_type = device_type.into();
+        let mut body = plist!(dict {
             "teamId": &team.team_id,
             "appIdId": &app_id.app_id_id,
         });
+        body.extend(platform_fields(&device_type));
 
         let response: Profile = self
             .developer_session()
